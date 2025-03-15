@@ -1,0 +1,92 @@
+# Import  libraries
+import h5py
+import numpy as np
+import tensorflow as tf
+from scipy.io import loadmat, savemat
+from sklearn.model_selection import train_test_split
+
+# Load the dataset
+with h5py.File('/users/irchchaf/Documents/DL/PycharmProjects/strt/Test/DatasetAA.mat', 'r') as mat:
+    X = np.array(mat['DatasetAA']['input'])[:]  # Ensure correct array extraction
+    Y = np.array(mat['DatasetAA']['output'])[:]
+
+# Split dataset into train, validation, and test sets
+X_trainn, X_test, Y_trainn, Y_test = train_test_split(X, Y, test_size=0.20, random_state=42)
+X_train, X_val, Y_train, Y_val = train_test_split(X_trainn, Y_trainn, test_size=0.15, random_state=42)
+
+# System parameters
+Pt = 2.8262  # Total transmitted power
+num_subcarriers = 32  # Number of OFDM subcarriers
+num_users = 16  # Number of users
+subcarriers_per_user = num_subcarriers // num_users  # Integer division
+bandwidth = 500e6 / num_subcarriers  # Channel bandwidth per subcarrier
+No_dB = -174 + 10 * np.log10(bandwidth)  # Noise power in dB
+N_o = 10 ** (No_dB / 10)  # Noise power in linear scale
+
+# Model hyperparameters
+output_dim = 64
+batch_size = 256
+num_epochs = 100
+learning_rate = 0.0001
+l2_reg = tf.keras.regularizers.l2(1e-8) 
+
+# Custom loss function for rate optimization
+class AvgRateLoss(tf.keras.losses.Loss):
+    def call(self, y_true, y_pred):
+        y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
+        y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
+        y_pred = tf.complex(y_pred[:, :output_dim], y_pred[:, output_dim:])
+        y_pred = tf.expand_dims(y_pred, -1)
+        y_true = tf.complex(y_true[:, :output_dim, :], y_true[:, output_dim:, :])
+        snr = Pt / (num_subcarriers * N_o) * tf.pow(tf.abs(tf.matmul(y_true, y_pred, adjoint_a=True)), 2.0)
+        return -tf.reduce_mean(tf.math.log(1.0 + snr) / tf.math.log(2.0))  
+
+# Metric function for rate evaluation
+def rate_metric(y_true, y_pred):
+    y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
+    y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
+    y_pred = tf.complex(y_pred[:, :output_dim], y_pred[:, output_dim:])
+    y_pred = tf.expand_dims(y_pred, -1)
+    y_true = tf.complex(y_true[:, :output_dim, :], y_true[:, output_dim:, :])
+    snr = Pt / (num_subcarriers * N_o) * tf.pow(tf.abs(tf.matmul(y_true, y_pred, adjoint_a=True)), 2.0)
+    return tf.reduce_mean(tf.math.log(1.0 + snr) / tf.math.log(2.0))
+
+# Build the prediction model
+model = tf.keras.Sequential([
+    layers.Flatten(),
+    layers.BatchNormalization(),
+    layers.Dense(1024, activation='relu', kernel_regularizer=l2_reg),
+    layers.Dense(2048, activation='relu', kernel_regularizer=l2_reg),
+    layers.Dense(2048, activation='relu', kernel_regularizer=l2_reg),
+    layers.Dense(1024, activation='relu', kernel_regularizer=l2_reg),
+    layers.Dense(128, kernel_regularizer=l2_reg),
+    layers.Lambda(lambda x: tf.keras.backend.l2_normalize(x, axis=1))
+])
+
+# Compile the model
+optimizer = tf.keras.optimizers.Adam(learning_rate)
+model.compile(optimizer=optimizer, loss=AvgRateLoss(), metrics=[rate_metric])
+
+# Training with early stopping & learning rate reduction
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+    tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+]
+
+# Train the model
+model.fit(
+    X_train, Y_train,
+    batch_size=batch_size,
+    epochs=num_epochs,
+    verbose=2,
+    shuffle=True,
+    validation_data=(X_val, Y_val),
+    callbacks=callbacks
+)
+
+# Evaluate the model
+test_loss = model.evaluate(X_test, Y_test, verbose=0)
+print(f'EVALUATE RATE ON TEST SET: {test_loss}')
+
+# Save the model
+model.save('saved_model_BFpred')
